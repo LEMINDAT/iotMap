@@ -1,0 +1,177 @@
+import os
+import subprocess
+import xml.etree.ElementTree as ET
+
+SUMO_HOME = os.environ.get("SUMO_HOME")
+net = "map.net.xml"
+
+# ===== CONFIG - PEAK & OFF-PEAK HOURS =====
+# Peak hours: 7-9 AM, 5-7 PM
+# Off-peak: remaining hours
+
+# Thời gian (giây) - ví dụ: 0 = bắt đầu, 3600 = 1 giờ
+PEAK_HOURS = [
+    (0, 3600),        # 0:00 - 1:00 (1 giờ đầu)
+    (11400, 15000)    # 3:10 - 4:10 (1 giờ cuối)
+]
+END_TIME = 15000      # ~4.17 giờ (15000 giây)
+
+# Tần suất (càng lớn càng ít xe)
+p_motor_peak = 2      # xe máy (peak - cao điểm)
+p_motor_offpeak = 5   # xe máy (off-peak - không cao điểm)
+p_car_peak = 3        # ô tô (peak)
+p_car_offpeak = 7     # ô tô (off-peak)
+# =============================================
+
+def is_peak_hour(start_time, end_time):
+    """Kiểm tra nếu thời gian nằm trong giờ cao điểm"""
+    for peak_start, peak_end in PEAK_HOURS:
+        if start_time >= peak_start and end_time <= peak_end:
+            return True
+    return False
+
+def generate_trips_with_periods(vtype, filename, p_peak, p_offpeak):
+    """Tạo trips với hệ số khác nhau cho peak/off-peak"""
+    all_trips = []
+    
+    # Generate peak hours
+    for start_time, end_time in PEAK_HOURS:
+        subprocess.run([
+            "python", "randomTrips_custom.py",
+            "-n", net,
+            "-o", f"temp_peak_{filename}",
+            "--vehicle-class", vtype,
+            "-p", str(p_peak),
+            "-b", str(start_time),
+            "-e", str(end_time)
+        ])
+        
+        tree = ET.parse(f"temp_peak_{filename}")
+        all_trips.extend(tree.getroot())
+    
+    # Generate off-peak hours
+    offpeak_segments = [
+        (0, PEAK_HOURS[0][0]),
+        (PEAK_HOURS[0][1], PEAK_HOURS[1][0]),
+        (PEAK_HOURS[1][1], END_TIME)
+    ]
+    
+    for start_time, end_time in offpeak_segments:
+        if start_time < end_time:
+            subprocess.run([
+                "python", "randomTrips_custom.py",
+                "-n", net,
+                "-o", f"temp_offpeak_{filename}",
+                "--vehicle-class", vtype,
+                "-p", str(p_offpeak),
+                "-b", str(start_time),
+                "-e", str(end_time)
+            ])
+            
+            tree = ET.parse(f"temp_offpeak_{filename}")
+            all_trips.extend(tree.getroot())
+    
+    # Write combined
+    root = ET.Element("routes")
+    for trip in all_trips:
+        root.append(trip)
+    ET.ElementTree(root).write(filename)
+
+# 1. tạo trips riêng với peak/off-peak
+generate_trips_with_periods("motorcycle", "motor.xml", p_motor_peak, p_motor_offpeak)
+generate_trips_with_periods("passenger", "car.xml", p_car_peak, p_car_offpeak)
+
+print("✅ Tạo trips với giờ cao điểm (peak) & không cao điểm (off-peak)")
+
+# 2. gộp file
+all_trips = []
+counter = 0
+
+# map file → type
+file_type = {
+    "motor.xml": "motorcycle",
+    "car.xml": "passenger"
+}
+
+for file, vtype in file_type.items():
+    tree = ET.parse(file)
+    for trip in tree.getroot():
+        trip.set("id", str(counter))       # fix ID
+        trip.set("type", vtype)            # 🔥 gán type chuẩn
+        all_trips.append(trip)
+        counter += 1
+
+# sort theo thời gian
+all_trips.sort(key=lambda x: float(x.get("depart", 0)))
+
+# Phân tích trips: peak vs off-peak
+peak_trips = 0
+offpeak_trips = 0
+for trip in all_trips:
+    depart = float(trip.get("depart", 0))
+    if is_peak_hour(depart, depart):
+        peak_trips += 1
+    else:
+        offpeak_trips += 1
+
+print(f"📊 Thống kê trips:")
+print(f"   Giờ cao điểm: {peak_trips} chuyến")
+print(f"   Giờ không cao điểm: {offpeak_trips} chuyến")
+print(f"   Tổng cộng: {len(all_trips)} chuyến")
+
+# tạo root
+root = ET.Element("routes")
+
+# 🔥 thêm vType ngay từ đầu
+vtype_car = ET.Element("vType", {
+    "id": "passenger",
+    "accel": "1.0",
+    "decel": "4.5",
+    "maxSpeed": "13.9",
+    "length": "5",
+    "color": "0,0,255"      # màu xanh dương
+
+})
+
+vtype_motor = ET.Element("vType", {
+    "id": "motorcycle",
+    "accel": "2.5",
+    "decel": "4.5",
+    "maxSpeed": "16",
+    "length": "2",
+    "minGap": "0.5",
+    "guiShape": "motorcycle"
+})
+
+root.append(vtype_car)
+root.append(vtype_motor)
+
+# thêm trips
+for trip in all_trips:
+    root.append(trip)
+
+ET.ElementTree(root).write("trips.xml")
+
+print("✅ trips.xml chuẩn (ID + sort + vType)")
+
+# 3. convert sang route
+subprocess.run([
+    "duarouter",
+    "-n", net,
+    "-r", "trips.xml",
+    "-o", "cars.rou.xml",
+    "--remove-loops",
+    "--routing-algorithm", "dijkstra"
+])
+
+print("🚗 Hoàn thành cars.rou.xml")
+
+# Clean up temp files
+import glob
+for temp_file in glob.glob("temp_*.xml"):
+    try:
+        os.remove(temp_file)
+    except:
+        pass
+
+print("\n✅ Hoàn thành mô phỏng giờ cao điểm & không cao điểm!")
