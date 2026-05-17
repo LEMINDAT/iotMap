@@ -1,9 +1,14 @@
 import os
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 SUMO_HOME = os.environ.get("SUMO_HOME")
 net = "map.net.xml"
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
 
 # ===== CONFIG - PEAK & OFF-PEAK HOURS =====
 # Peak hours: 7-9 AM, 5-7 PM
@@ -18,10 +23,49 @@ END_TIME = 15000      # ~4.17 giờ (15000 giây)
 
 # Tần suất (càng lớn càng ít xe)
 p_motor_peak = 2      # xe máy (peak - cao điểm)
-p_motor_offpeak = 5   # xe máy (off-peak - không cao điểm)
-p_car_peak = 4        # ô tô (peak)
-p_car_offpeak = 7     # ô tô (off-peak)
+p_motor_offpeak = 10   # xe máy (off-peak - không cao điểm)
+p_car_peak = 6        # ô tô (peak)
+p_car_offpeak = 15     # ô tô (off-peak)
+
+# Scale traffic volume by map width. These base periods are tuned for the
+# current map.net.xml width: 266.39 - 24.32 = 242.07m.
+BASE_MAP_WIDTH = 242.07
+MIN_PERIOD = 0.2
 # =============================================
+
+def get_map_width(net_file):
+    """Read map width from SUMO convBoundary: x_min,y_min,x_max,y_max."""
+    root = ET.parse(net_file).getroot()
+    location = root.find("location")
+    if location is None:
+        raise ValueError(f"Cannot find <location> in {net_file}")
+
+    conv_boundary = location.get("convBoundary")
+    if not conv_boundary:
+        raise ValueError(f"Cannot find convBoundary in {net_file}")
+
+    try:
+        x_min, _, x_max, _ = [float(value) for value in conv_boundary.split(",")]
+    except ValueError as exc:
+        raise ValueError(f"Invalid convBoundary in {net_file}: {conv_boundary}") from exc
+
+    width = x_max - x_min
+    if width <= 0:
+        raise ValueError(f"Invalid map width from convBoundary in {net_file}: {width}")
+    return width
+
+def scale_period(base_period, scale):
+    """Smaller period means more vehicles; wider maps generate more vehicles."""
+    return max(base_period / scale, MIN_PERIOD)
+
+map_width = get_map_width(net)
+traffic_scale = map_width / BASE_MAP_WIDTH
+
+print("=== Traffic scale by map width ===")
+print(f"Map file: {net}")
+print(f"Map width: {map_width:.2f} m")
+print(f"Base width: {BASE_MAP_WIDTH:.2f} m")
+print(f"Traffic scale: {traffic_scale:.3f}x")
 
 def is_peak_hour(start_time, end_time):
     """Kiểm tra nếu thời gian nằm trong giờ cao điểm"""
@@ -33,6 +77,11 @@ def is_peak_hour(start_time, end_time):
 def generate_trips_with_periods(vtype, filename, p_peak, p_offpeak):
     """Tạo trips với hệ số khác nhau cho peak/off-peak"""
     all_trips = []
+    scaled_peak = scale_period(p_peak, traffic_scale)
+    scaled_offpeak = scale_period(p_offpeak, traffic_scale)
+
+    print(f"{vtype}: peak period {p_peak} -> {scaled_peak:.3f}s")
+    print(f"{vtype}: off-peak period {p_offpeak} -> {scaled_offpeak:.3f}s")
     
     # Generate peak hours
     for start_time, end_time in PEAK_HOURS:
@@ -41,7 +90,7 @@ def generate_trips_with_periods(vtype, filename, p_peak, p_offpeak):
             "-n", net,
             "-o", f"temp_peak_{filename}",
             "--vehicle-class", vtype,
-            "-p", str(p_peak),
+            "-p", str(scaled_peak),
             "-b", str(start_time),
             "-e", str(end_time)
         ])
@@ -63,7 +112,7 @@ def generate_trips_with_periods(vtype, filename, p_peak, p_offpeak):
                 "-n", net,
                 "-o", f"temp_offpeak_{filename}",
                 "--vehicle-class", vtype,
-                "-p", str(p_offpeak),
+                "-p", str(scaled_offpeak),
                 "-b", str(start_time),
                 "-e", str(end_time)
             ])
@@ -187,7 +236,7 @@ vtype_motor = ET.Element("vType", {
     "lcAssertive": "0.9",
     "lcSigma": "0.15",
 
-    # Nút giao: bỏ hẳn hành vi nguy hiểm
+    # Nút giao: 
     "jmIgnoreFoeProb": "0.0",
     "jmIgnoreFoeSpeed": "0",
     "jmTimegapMinor": "1.5",
