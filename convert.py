@@ -19,7 +19,7 @@ END_TIME = 15000      # ~4.17 giờ (15000 giây)
 # Tần suất (càng lớn càng ít xe)
 p_motor_peak = 2      # xe máy (peak - cao điểm)
 p_motor_offpeak = 5   # xe máy (off-peak - không cao điểm)
-p_car_peak = 3        # ô tô (peak)
+p_car_peak = 4        # ô tô (peak)
 p_car_offpeak = 7     # ô tô (off-peak)
 # =============================================
 
@@ -125,22 +125,76 @@ root = ET.Element("routes")
 # 🔥 thêm vType ngay từ đầu
 vtype_car = ET.Element("vType", {
     "id": "passenger",
+    "vClass": "passenger",
+
+    # Kích thước / động lực học
     "accel": "1.0",
     "decel": "4.5",
-    "maxSpeed": "13.9",
-    "length": "5",
-    "color": "0,0,255"      # màu xanh dương
+    "emergencyDecel": "9.0",
 
+    "length": "4.5",
+    "width": "1.8",
+    "minGap": "1.8",
+
+    # Bám xe: an toàn hơn để tránh đâm đuôi
+    "tau": "1.3",
+    "sigma": "0.2",
+    "speedFactor": "1.00",
+    "speedDev": "0.05",
+
+    # Chuyển làn: vẫn đổi làn nhưng không chen nguy hiểm
+    "lcStrategic": "1.0",
+    "lcCooperative": "0.8",
+    "lcSpeedGain": "1.1",
+    "lcKeepRight": "0.2",
+    "lcAssertive": "0.8",
+    "lcSigma": "0.1",
+
+    # Nút giao: bỏ hẳn hành vi cố vượt/ép xe
+    "jmIgnoreFoeProb": "0.0",
+    "jmIgnoreFoeSpeed": "0",
+    "jmTimegapMinor": "1.5",
+    "impatience": "0.0",
+
+    "color": "0,0,255"
 })
+
 
 vtype_motor = ET.Element("vType", {
     "id": "motorcycle",
-    "accel": "2.5",
+    "vClass": "motorcycle",
+
+    # Kích thước / động lực học
+    "accel": "2.0",
     "decel": "4.5",
-    "maxSpeed": "16",
-    "length": "2",
-    "minGap": "0.5",
-    "guiShape": "motorcycle"
+    "emergencyDecel": "8.0",
+
+    "length": "1.8",
+    "width": "0.65",
+    "minGap": "1.2",
+
+    # Bám xe: tăng an toàn nhưng vẫn hợp xe máy
+    "tau": "1.2",
+    "sigma": "0.25",
+    "speedFactor": "1.00",
+    "speedDev": "0.08",
+
+    # Lách làn nhẹ: vẫn linh hoạt nhưng không ép sát
+    "lcStrategic": "0.8",
+    "lcCooperative": "0.7",
+    "lcSpeedGain": "1.2",
+    "lcKeepRight": "0",
+    "lcAssertive": "0.9",
+    "lcSigma": "0.15",
+
+    # Nút giao: bỏ hẳn hành vi nguy hiểm
+    "jmIgnoreFoeProb": "0.0",
+    "jmIgnoreFoeSpeed": "0",
+    "jmTimegapMinor": "1.5",
+    "impatience": "0.0",
+
+    "guiShape": "motorcycle",
+    "color": "255,0,0"
 })
 
 root.append(vtype_car)
