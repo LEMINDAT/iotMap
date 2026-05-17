@@ -1,0 +1,23 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# YOLO outputs
+runs/
+
+# Model weights
+*.pt
+
+# Images (optional)
+*.png
+*.jpg
+*.jpeg
+
+# VSCode
+.vscode/
+
+# Environment files
+.env
