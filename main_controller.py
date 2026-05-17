@@ -1,352 +1,461 @@
 """
 main_controller.py
 ===================================================
-Dieu khien den giao thong thong minh dua tren MAT DO XE.
+Thuat toan dieu khien den giao thong:
 
-Thuat toan:
-  1. Do mat do xe tren TOAN BO edge dan toi nga tu
-  2. Chia thoi gian xanh TY LE voi luong xe moi huong
-  3. Khi gridlock: GIU xanh 1 huong du lau de xe thoat ra
-  4. Khong doi qua nhanh khi spillback
-  5. Bo pha trong: neu huong khong co xe -> skip
+  TINH LUU LUONG — PCE (Passenger Car Equivalent)
+    xe may = 0.5 PCE  |  o to = 1.0 PCE
+    flow_pce = moto*0.5 + car*1.0
 
-  CHI dieu chinh den tin hieu, KHONG can thiep vao xe.
-  Dung map da tao boi: python convert.py
-  Config:               sim.sumocfg
+  QUYET DINH THOI GIAN XANH — Webster's Formula (1958)
+    Tieu chuan ky thuat giao thong duong bo quoc te.
+    Tinh thoi gian xanh TY LE voi luu luong tung huong:
+
+      y_i  = flow_i / S   (S = 1800 PCE/h = bao hoa)
+      C*   = (1.5*L + 5) / (1 - sum(y_i))   chu ky toi uu
+      g_i  = (C* - L) * y_i / sum(y_i)      thoi gian xanh toi uu
+
+    Vi du:
+      Huong NS: 400 PCE/h  -> y=0.22
+      Huong EW: 600 PCE/h  -> y=0.33
+      C* = 60s
+      g_NS = 60 * 0.22/0.55 = 24s
+      g_EW = 60 * 0.33/0.55 = 36s
+
+  DEN VANG 3 GIAY — bat buoc truoc khi doi xanh
+    GREEN --(het g_i)--> YELLOW --(3s)--> GREEN (pha tiep)
 
 Cach chay:
   python main_controller.py
 """
 
-import os, sys, time, traci
+import traci
 
-# --- CONFIG ---
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 SUMO_BINARY = "sumo-gui"
 SUMO_CONFIG = "sim.sumocfg"
 
-# Thong so dieu khien
-MIN_GREEN          = 8       # giay toi thieu pha xanh
-MAX_GREEN          = 50      # giay toi da pha xanh
-YELLOW_TIME        = 3       # giay vang (co san trong map)
+YELLOW_TIME = 3     # giay den vang bat buoc
 
-# Nguong
-PRESSURE_RATIO     = 1.3     # huong cho ap luc hon X lan -> doi
-MAX_WAIT_SECONDS   = 40      # giay cho toi da truoc khi bat buoc doi
-GRIDLOCK_THRESHOLD = 0.7     # 70% xe dung yen -> coi la gridlock
-GRIDLOCK_MIN_GREEN = 20      # khi gridlock: giu xanh it nhat nay giay
+# PCE — Passenger Car Equivalent
+PCE_MOTORCYCLE = 0.5
+PCE_CAR        = 1.0
 
-DASHBOARD_INTERVAL = 30
+# Webster parameters
+SATURATION_FLOW = 1800   # PCE/gio — luu luong bao hoa (tieu chuan)
+LOST_TIME       = 4      # giay mat mat moi pha (thoi gian khoi dong + giai toa)
+MIN_GREEN       = 10     # giay — gioi han duoi cho thoi gian xanh
+MAX_GREEN       = 90     # giay — gioi han tren
+MIN_CYCLE       = 30     # giay — chu ky toi thieu
+MAX_CYCLE       = 120    # giay — chu ky toi da
+
+# Gridlock
+GRIDLOCK_THRESHOLD = 0.70
+GRIDLOCK_MIN_GREEN = 20
+
+DASHBOARD_INTERVAL = 20
+
+# ─── STATE MACHINE ───────────────────────────────────────────────────────────
+
+STATE_GREEN  = "GREEN"
+STATE_YELLOW = "YELLOW"
 
 
-# --- DENSITY-BASED CONTROLLER ---
+# ─── PCE ─────────────────────────────────────────────────────────────────────
+
+def get_edge_pce(edge_id):
+    """
+    Dem xe may va o to tren 1 edge, tinh PCE.
+    """
+    moto = car = halting = 0
+    max_wait = 0.0
+    try:
+        for vid in traci.edge.getLastStepVehicleIDs(edge_id):
+            try:
+                vtype = traci.vehicle.getTypeID(vid).lower()
+                speed = traci.vehicle.getSpeed(vid)
+                wait  = traci.vehicle.getWaitingTime(vid)
+                if "motorcycle" in vtype or "moto" in vtype:
+                    moto += 1
+                else:
+                    car += 1
+                if speed < 0.3:
+                    halting += 1
+                if wait > max_wait:
+                    max_wait = wait
+            except traci.TraCIException:
+                car += 1
+    except traci.TraCIException:
+        pass
+
+    pce = moto * PCE_MOTORCYCLE + car * PCE_CAR
+    return {
+        "pce":      pce,
+        "moto":     moto,
+        "car":      car,
+        "halting":  halting,
+        "max_wait": max_wait,
+    }
+
+
+def get_phase_pce(edges):
+    """Gop PCE cua nhieu edges thanh 1 pha."""
+    total_pce = total_moto = total_car = total_halt = 0
+    max_wait  = 0.0
+    for edge in edges:
+        d = get_edge_pce(edge)
+        total_pce  += d["pce"]
+        total_moto += d["moto"]
+        total_car  += d["car"]
+        total_halt += d["halting"]
+        if d["max_wait"] > max_wait:
+            max_wait = d["max_wait"]
+    vehicles   = total_moto + total_car
+    halt_ratio = total_halt / max(vehicles, 1)
+    return {
+        "pce":        total_pce,
+        "moto":       total_moto,
+        "car":        total_car,
+        "vehicles":   vehicles,
+        "halting":    total_halt,
+        "halt_ratio": halt_ratio,
+        "max_wait":   max_wait,
+    }
+
+
+# ─── WEBSTER'S FORMULA ───────────────────────────────────────────────────────
+
+def webster(phase_flows_pce_per_hour, n_phases):
+    """
+    Tinh thoi gian xanh toi uu theo Webster (1958).
+
+    Tham so:
+      phase_flows_pce_per_hour : list luu luong tung pha (PCE/gio)
+      n_phases                 : so pha
+
+    Tra ve:
+      green_times : list thoi gian xanh (giay) cho tung pha
+      cycle       : chu ky toi uu (giay)
+
+    Cong thuc:
+      y_i = q_i / S              (ti so luu luong/bao hoa)
+      L   = n_phases * LOST_TIME (tong thoi gian mat mat)
+      C*  = (1.5*L + 5) / (1 - sum(y))   chu ky Webster
+      g_i = (C* - L) * (y_i / sum(y))    thoi gian xanh
+    """
+    S = SATURATION_FLOW
+
+    # Tinh y_i cho tung pha
+    y = [q / S for q in phase_flows_pce_per_hour]
+    sum_y = sum(y)
+
+    # Tong thoi gian mat mat
+    L = n_phases * LOST_TIME
+
+    # Tranh chia cho 0 hoac am (qua tai)
+    if sum_y <= 0:
+        # Khong co xe: chia deu thoi gian
+        g = max(MIN_GREEN, MIN_CYCLE // n_phases)
+        return [g] * n_phases, g * n_phases
+
+    if sum_y >= 0.95:
+        # Qua tai (> 95% bao hoa): dung MAX_GREEN
+        return [MAX_GREEN] * n_phases, MAX_GREEN * n_phases
+
+    # Chu ky toi uu Webster
+    cycle = (1.5 * L + 5) / (1 - sum_y)
+    cycle = max(MIN_CYCLE, min(MAX_CYCLE, cycle))
+
+    # Thoi gian xanh tung pha
+    green_times = []
+    for yi in y:
+        if yi <= 0:
+            green_times.append(MIN_GREEN)
+        else:
+            gi = (cycle - L) * (yi / sum_y)
+            gi = max(MIN_GREEN, min(MAX_GREEN, gi))
+            green_times.append(gi)
+
+    return green_times, cycle
+
+
+# ─── CONTROLLER ──────────────────────────────────────────────────────────────
 
 class DensityController:
+    """
+    Dieu khien 1 nut den bang Webster's Formula.
+
+    Moi chu ky:
+      1. Do luu luong PCE tung pha (xe/gio)
+      2. Chay Webster -> tinh g_i toi uu cho tung pha
+      3. Chay tung pha theo g_i, vang 3s giua cac pha
+    """
 
     def __init__(self, tls_id):
-        self.tls_id = tls_id
+        self.tls_id       = tls_id
+        self.state        = STATE_GREEN
+        self.switch_count = 0
+        self.yellow_start = None
 
         logic = traci.trafficlight.getAllProgramLogics(tls_id)[0]
-        self.all_phases = logic.phases
-        self.num_phases = len(logic.phases)
-
+        self.all_phases  = logic.phases
+        self.num_phases  = len(logic.phases)
         self.green_phases = [
             i for i, p in enumerate(logic.phases)
             if 'G' in p.state or 'g' in p.state
         ]
 
-        controlled_links = traci.trafficlight.getControlledLinks(tls_id)
+        # Map pha -> edges
+        links = traci.trafficlight.getControlledLinks(tls_id)
+        self.phase_edges = {}
+        for gp in self.green_phases:
+            edges = set()
+            for i, s in enumerate(self.all_phases[gp].state):
+                if s in ('G', 'g') and i < len(links):
+                    for link in links[i]:
+                        edges.add(link[0].rsplit('_', 1)[0])
+            self.phase_edges[gp] = list(edges)
 
-        self.phase_in_edges = {}
-        self.phase_out_edges = {}
+        self.cur_idx     = 0
+        self.green_start = traci.simulation.getTime()
 
-        for phase_idx in self.green_phases:
-            state = self.all_phases[phase_idx].state
-            in_edges = set()
-            out_edges = set()
-
-            for i, s in enumerate(state):
-                if s in ('G', 'g') and i < len(controlled_links):
-                    for link in controlled_links[i]:
-                        in_lane, out_lane, _ = link
-                        in_edge = in_lane.rsplit('_', 1)[0]
-                        out_edge = out_lane.rsplit('_', 1)[0]
-                        in_edges.add(in_edge)
-                        out_edges.add(out_edge)
-
-            self.phase_in_edges[phase_idx] = list(in_edges)
-            self.phase_out_edges[phase_idx] = list(out_edges)
-
-        self.current_green_idx = 0
-        self.green_start_time = traci.simulation.getTime()
-        self.switch_count = 0
-        self.gridlock_mode = False
+        # Khoi tao thoi gian xanh bang nhau
+        self.green_times = [MIN_GREEN] * len(self.green_phases)
 
         traci.trafficlight.setPhase(tls_id, self.green_phases[0])
 
-        in_info = {gp: self.phase_in_edges[gp] for gp in self.green_phases}
-        print("  [TLS %s] %d pha | edges: %s" % (tls_id, len(self.green_phases), str(in_info)))
+        print("  [TLS %s] %d pha | Webster S=%d PCE/h L=%ds" % (
+            tls_id, len(self.green_phases), SATURATION_FLOW, LOST_TIME))
+        for gp in self.green_phases:
+            print("    Pha %d: %s" % (gp, self.phase_edges[gp]))
 
-    def _get_edge_demand(self, phase_idx):
-        edges = self.phase_in_edges.get(phase_idx, [])
-        total_vehicles = 0
-        total_halting = 0
-        total_waiting = 0.0
-        max_waiting = 0.0
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
-        for edge in edges:
-            try:
-                v = traci.edge.getLastStepVehicleNumber(edge)
-                h = traci.edge.getLastStepHaltingNumber(edge)
-                w = traci.edge.getWaitingTime(edge)
-                total_vehicles += v
-                total_halting += h
-                total_waiting += w
-                if w > max_waiting:
-                    max_waiting = w
-            except traci.TraCIException:
-                pass
+    def _cur_green(self):
+        return self.green_phases[self.cur_idx]
 
-        return {
-            "vehicles":    total_vehicles,
-            "halting":     total_halting,
-            "waiting":     total_waiting,
-            "max_waiting": max_waiting,
-            "demand":      total_halting * 2 + total_vehicles,
-        }
+    def _elapsed(self, sim_time):
+        return sim_time - self.green_start
 
-    def _get_downstream_halting(self, phase_idx):
-        """So xe dung tren outgoing edges."""
-        out_edges = self.phase_out_edges.get(phase_idx, [])
-        total = 0
-        for edge in out_edges:
-            try:
-                total += traci.edge.getLastStepHaltingNumber(edge)
-            except traci.TraCIException:
-                pass
-        return total
+    def _target_green(self):
+        return self.green_times[self.cur_idx]
 
-    def _calc_green_time(self, cur_demand, next_demand):
-        """Tinh thoi gian xanh dua tren ty le demand."""
-        total = cur_demand["demand"] + next_demand["demand"]
-        if total == 0:
-            return MIN_GREEN
+    # ── Cap nhat Webster moi chu ky ──────────────────────────────────────────
 
-        ratio = cur_demand["demand"] / max(total, 1)
-        # Thoi gian xanh ty le
-        available = MAX_GREEN + MIN_GREEN  # tong green cho 2 pha
-        gt = available * ratio
-        return max(MIN_GREEN, min(MAX_GREEN, gt))
+    def _update_webster(self):
+        """
+        Do luu luong hien tai, tinh lai thoi gian xanh toi uu.
+        Goi 1 lan moi khi bat dau pha xanh moi.
+        """
+        # Do luu luong tung pha (PCE/buoc) -> quy doi sang PCE/gio
+        # SUMO step = 1s, nhan 3600 de ra PCE/gio
+        flows_per_hour = []
+        for gp in self.green_phases:
+            pce_data = get_phase_pce(self.phase_edges[gp])
+            # PCE hien tai tren edge * 3600 = luong xe uoc tinh moi gio
+            flows_per_hour.append(pce_data["pce"] * 3600 / 60)
 
-    def _switch_to_next(self, sim_time, reason):
-        cur_phase = self.green_phases[self.current_green_idx]
-        yellow = (cur_phase + 1) % self.num_phases
-        traci.trafficlight.setPhase(self.tls_id, yellow)
+        # Chay Webster
+        self.green_times, cycle = webster(flows_per_hour, len(self.green_phases))
 
-        self.current_green_idx = (self.current_green_idx + 1) % len(self.green_phases)
-        self.green_start_time = sim_time + YELLOW_TIME
-        self.switch_count += 1
+        print("  [Webster %s] cycle=%.0fs | %s" % (
+            self.tls_id,
+            cycle,
+            " | ".join("P%d=%.0fs" % (self.green_phases[i], self.green_times[i])
+                       for i in range(len(self.green_phases)))))
 
-        next_green = self.green_phases[self.current_green_idx]
-        print("  >> %s: -> P%d | %s" % (self.tls_id, next_green, reason))
+    # ── Step chinh ───────────────────────────────────────────────────────────
 
     def step(self, sim_time, is_gridlock):
-        current_sumo_phase = traci.trafficlight.getPhase(self.tls_id)
-        cur_green = self.green_phases[self.current_green_idx]
 
-        # Dang trong pha vang -> cho
-        if current_sumo_phase != cur_green:
+        # ── DANG VANG: cho du 3 giay ─────────────────────────────────────────
+        if self.state == STATE_YELLOW:
+            if sim_time - self.yellow_start >= YELLOW_TIME:
+                # Sang pha xanh tiep theo
+                self.cur_idx    = (self.cur_idx + 1) % len(self.green_phases)
+                self.green_start = sim_time
+                self.state       = STATE_GREEN
+                traci.trafficlight.setPhase(self.tls_id, self._cur_green())
+
+                # Cap nhat Webster cho chu ky moi
+                self._update_webster()
+
+                print("  🟢 %s P%d XANH %.0fs (Webster)" % (
+                    self.tls_id, self._cur_green(), self._target_green()))
             return
 
-        elapsed = sim_time - self.green_start_time
+        # ── DANG XANH: kiem tra het thoi gian Webster chua ───────────────────
+        elapsed    = self._elapsed(sim_time)
+        target     = self._target_green()
+        min_green  = GRIDLOCK_MIN_GREEN if is_gridlock else MIN_GREEN
 
-        # Tinh demand
-        next_idx = (self.current_green_idx + 1) % len(self.green_phases)
-        next_green = self.green_phases[next_idx]
-
-        cur_demand = self._get_edge_demand(cur_green)
-        next_demand = self._get_edge_demand(next_green)
-
-        # Tinh green toi uu
-        target_green = self._calc_green_time(cur_demand, next_demand)
-
-        # Khi GRIDLOCK: tang min green de xe co thoi gian thoat
-        min_green_now = GRIDLOCK_MIN_GREEN if is_gridlock else MIN_GREEN
-
-        if elapsed < min_green_now:
+        # Chua du MIN_GREEN -> giu nguyen
+        if elapsed < min_green:
             return
+
+        pce = get_phase_pce(self.phase_edges[self._cur_green()])
 
         should_switch = False
-        reason = ""
+        reason        = ""
 
-        # 1. MAX_GREEN bat buoc
+        # 1. Bat buoc: qua MAX_GREEN
         if elapsed >= MAX_GREEN:
             should_switch = True
-            reason = "max green %ds" % MAX_GREEN
+            reason = "MAX_GREEN %ds" % MAX_GREEN
 
-        # 2. Pha hien tai TRONG, huong khac co xe
-        elif cur_demand["vehicles"] == 0 and next_demand["vehicles"] > 0:
+        # 2. Pha trong: khong co xe
+        elif pce["vehicles"] == 0 and elapsed >= min_green:
             should_switch = True
-            reason = "pha trong -> kia co %d xe" % next_demand["vehicles"]
+            reason = "pha trong"
 
-        # 3. Dat target green (ty le demand)
-        elif elapsed >= target_green:
+        # 3. Webster: het thoi gian xanh toi uu
+        elif elapsed >= target:
             should_switch = True
-            reason = ("target %.0fs | cur:%d/%d next:%d/%d" %
-                      (target_green,
-                       cur_demand["halting"], cur_demand["vehicles"],
-                       next_demand["halting"], next_demand["vehicles"]))
+            reason = ("Webster g=%.0fs elapsed=%.0fs | "
+                      "moto=%d(%.1fPCE) car=%d(%.1fPCE) total=%.1fPCE") % (
+                target, elapsed,
+                pce["moto"], pce["moto"] * PCE_MOTORCYCLE,
+                pce["car"],  pce["car"]  * PCE_CAR,
+                pce["pce"])
 
-        # 4. Huong cho co demand cao hon nhieu
-        elif (next_demand["demand"] > cur_demand["demand"] * PRESSURE_RATIO
-              and next_demand["halting"] >= 3
-              and elapsed >= min_green_now + 3):
-            should_switch = True
-            reason = ("density %d > %d*%.1f" %
-                      (next_demand["demand"],
-                       cur_demand["demand"], PRESSURE_RATIO))
-
-        # 5. Starvation
-        elif next_demand["max_waiting"] > MAX_WAIT_SECONDS and elapsed >= min_green_now:
-            should_switch = True
-            reason = ("starvation cho %.0fs" % next_demand["max_waiting"])
-
+        # ── Bat den vang 3 giay ───────────────────────────────────────────────
         if should_switch:
-            self._switch_to_next(sim_time, reason)
+            yellow_idx = (self._cur_green() + 1) % self.num_phases
+            traci.trafficlight.setPhase(self.tls_id, yellow_idx)
+            self.state        = STATE_YELLOW
+            self.yellow_start = sim_time
+            self.switch_count += 1
+            print("  🟡 %s VANG 3s | %s" % (self.tls_id, reason))
+
+    # ── Status ───────────────────────────────────────────────────────────────
 
     def get_status(self):
-        current_phase = traci.trafficlight.getPhase(self.tls_id)
-        results = []
-        for gp in self.green_phases:
-            d = self._get_edge_demand(gp)
-            ds_halt = self._get_downstream_halting(gp)
-            results.append({
-                "phase": gp,
-                "demand": d,
-                "is_green": (gp == current_phase),
-                "downstream_halt": ds_halt,
-                "edges": self.phase_in_edges[gp],
+        cur = traci.trafficlight.getPhase(self.tls_id)
+        out = []
+        for i, gp in enumerate(self.green_phases):
+            pce = get_phase_pce(self.phase_edges[gp])
+            out.append({
+                "phase":    gp,
+                "pce":      pce,
+                "is_green": gp == cur,
+                "target_g": self.green_times[i] if i < len(self.green_times) else 0,
+                "state":    self.state,
+                "edges":    self.phase_edges[gp],
             })
-        return results
+        return out
 
 
-# --- DASHBOARD ---
+# ─── GRIDLOCK ────────────────────────────────────────────────────────────────
 
 def check_gridlock():
-    """Kiem tra toan mang co bi gridlock khong."""
     total = traci.vehicle.getIDCount()
     if total < 10:
         return False, 0, total
     all_ids = traci.vehicle.getIDList()
-    waiting = sum(1 for vid in all_ids if traci.vehicle.getSpeed(vid) < 0.1)
-    pct = waiting / total
-    return pct >= GRIDLOCK_THRESHOLD, waiting, total
+    waiting = sum(1 for v in all_ids if traci.vehicle.getSpeed(v) < 0.1)
+    return waiting / total >= GRIDLOCK_THRESHOLD, waiting, total
 
+
+# ─── DASHBOARD ───────────────────────────────────────────────────────────────
 
 def print_dashboard(sim_time, controllers, is_gridlock, waiting, total):
     print("")
-    print("=" * 75)
-    print("  SimTime: %.0fs%s" % (sim_time, "  *** GRIDLOCK MODE ***" if is_gridlock else ""))
-    print("  %-6s %-4s %-18s %-5s %-5s %-6s %-6s %s" %
-          ("TLS", "Pha", "Edges", "Xe", "Dung", "Wait", "DsHlt", ""))
-    print("  %s %s %s %s %s %s %s %s" %
-          ("-"*6, "-"*4, "-"*18, "-"*5, "-"*5, "-"*6, "-"*6, "-"*5))
+    print("=" * 80)
+    print("  SimTime: %.0fs%s" % (
+        sim_time, "  *** GRIDLOCK ***" if is_gridlock else ""))
+    print("  %-8s %-4s %-5s %-4s %-6s %-6s %-8s %-8s" % (
+        "TLS", "Pha", "Moto", "Car", "PCE", "Dung%", "TargetG", "Trang thai"))
+    print("  " + "-"*78)
 
     for tls_id, ctrl in controllers.items():
         for s in ctrl.get_status():
-            d = s["demand"]
-            marker = " <== GREEN" if s["is_green"] else ""
-            edges_str = ",".join(s["edges"])
-            if len(edges_str) > 17:
-                edges_str = edges_str[:14] + "..."
-            print("  %-6s P%-3d %-18s %-5d %-5d %-6.0f %-6d%s" %
-                  (tls_id, s["phase"], edges_str,
-                   d["vehicles"], d["halting"],
-                   d["max_waiting"], s["downstream_halt"], marker))
+            p      = s["pce"]
+            marker = "<XANH" if s["is_green"] else "     "
+            state  = s["state"] if s["is_green"] else ""
+            print("  %-8s P%-3d %-5d %-4d %-6.1f %-6s %-8.0fs %s %s" % (
+                tls_id, s["phase"],
+                p["moto"], p["car"], p["pce"],
+                "%.0f%%" % (p["halt_ratio"] * 100),
+                s["target_g"],
+                marker, state))
 
     if total > 0:
-        avg_speed = sum(traci.vehicle.getSpeed(vid) for vid in traci.vehicle.getIDList()) / total
-        teleported = traci.simulation.getStartingTeleportNumber()
-        pct = waiting / total * 100
-
+        all_ids    = traci.vehicle.getIDList()
+        avg_speed  = sum(traci.vehicle.getSpeed(v) for v in all_ids) / total
+        teleport   = traci.simulation.getStartingTeleportNumber()
+        pct        = waiting / total * 100
+        total_moto = sum(1 for v in all_ids
+                         if "motorcycle" in traci.vehicle.getTypeID(v).lower())
+        total_car  = total - total_moto
         print("")
-        print("  Tong: %d xe | Dung yen: %d (%.0f%%) | V_tb: %.1f m/s | Teleport: %d" %
-              (total, waiting, pct, avg_speed, teleported))
+        print("  Xe may: %d (%.1f PCE) | O to: %d (%.1f PCE) | Tong: %d xe" % (
+            total_moto, total_moto * PCE_MOTORCYCLE,
+            total_car,  total_car  * PCE_CAR, total))
+        print("  Dung: %d (%.0f%%) | V_tb: %.1f m/s | Teleport: %d" % (
+            waiting, pct, avg_speed, teleport))
+        if   pct > 70: print("  [!!!] UN TAC NGHIEM TRONG")
+        elif pct > 40: print("  [!!]  Un tac trung binh")
+        else:          print("  [OK]  Giao thong on dinh")
+    print("=" * 80)
 
-        if pct > 70:
-            print("  [!!!] UN TAC NGHIEM TRONG")
-        elif pct > 40:
-            print("  [!!] Un tac trung binh")
-        else:
-            print("  [OK] Giao thong on dinh")
-    print("=" * 75)
 
-
-# --- MAIN ---
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def run():
-    print("=" * 60)
-    print("  Density-Based Traffic Signal Controller")
-    print("  Dieu khien den dua tren MAT DO XE thuc te")
-    print("=" * 60)
-    print("  Config:     %s" % SUMO_CONFIG)
-    print("  Green:      %ds - %ds (gridlock: min %ds)" % (MIN_GREEN, MAX_GREEN, GRIDLOCK_MIN_GREEN))
-    print("  Pressure:   >%.1fx to switch" % PRESSURE_RATIO)
-    print("  MaxWait:    %ds" % MAX_WAIT_SECONDS)
-    print("  Gridlock:   >%.0f%% halting" % (GRIDLOCK_THRESHOLD * 100))
+    print("=" * 65)
+    print("  Webster's Formula Traffic Controller")
+    print("=" * 65)
+    print("  Luu luong : PCE  (moto=%.1f  car=%.1f)" % (
+        PCE_MOTORCYCLE, PCE_CAR))
+    print("  Thuat toan: Webster 1958")
+    print("    S=%d PCE/h | L=%ds/pha" % (SATURATION_FLOW, LOST_TIME))
+    print("    g_i = (C* - L) * y_i / sum(y)")
+    print("  Den vang  : %ds bat buoc" % YELLOW_TIME)
+    print("  Green     : %ds - %ds" % (MIN_GREEN, MAX_GREEN))
     print("")
 
-    sumo_cmd = [SUMO_BINARY, "-c", SUMO_CONFIG, "--start"]
-    traci.start(sumo_cmd)
-    print("[OK] Ket noi TraCI thanh cong")
-    print("")
+    traci.start([SUMO_BINARY, "-c", SUMO_CONFIG, "--start"])
+    print("[OK] Ket noi TraCI\n")
 
-    tls_ids = traci.trafficlight.getIDList()
     controllers = {}
-    for tid in tls_ids:
+    for tid in traci.trafficlight.getIDList():
         try:
             controllers[tid] = DensityController(tid)
         except Exception as e:
-            print("  [WARN] Bo qua %s: %s" % (tid, str(e)))
+            print("  [WARN] %s: %s" % (tid, e))
 
-    print("")
-    print("  Dieu khien %d nut den: %s" % (len(controllers), str(list(controllers.keys()))))
-    print("")
+    print("\n  %d nut den: %s\n" % (len(controllers), list(controllers.keys())))
 
     last_dash = 0
-
     while traci.simulation.getMinExpectedNumber() > 0:
         traci.simulationStep()
         sim_time = traci.simulation.getTime()
 
-        # Kiem tra gridlock
         is_gridlock, waiting, total = check_gridlock()
 
-        # Dieu khien den
-        for tid, ctrl in controllers.items():
+        for ctrl in controllers.values():
             try:
                 ctrl.step(sim_time, is_gridlock)
-            except Exception as e:
+            except Exception:
                 pass
 
-        # Dashboard
         if sim_time - last_dash >= DASHBOARD_INTERVAL:
             print_dashboard(sim_time, controllers, is_gridlock, waiting, total)
             last_dash = sim_time
 
     traci.close()
-    print("")
-    print("[OK] Mo phong ket thuc!")
+    print("\n[OK] Ket thuc!")
 
 
 if __name__ == "__main__":
     try:
         run()
     except KeyboardInterrupt:
-        print("\n[STOP] Dung")
+        print("\n[STOP]")
         try: traci.close()
         except: pass
-    except Exception as e:
+    except Exception:
         import traceback; traceback.print_exc()
         try: traci.close()
         except: pass
