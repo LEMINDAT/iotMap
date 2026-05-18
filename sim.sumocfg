@@ -6,7 +6,9 @@
 
     <processing>
         <lateral-resolution value="0.5"/>
-        
+	
+        <collision.action value="teleport"/>
+    	<collision.stoptime value="5"/>
     </processing>
 
     <time>
