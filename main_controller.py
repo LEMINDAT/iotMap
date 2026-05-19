@@ -3,37 +3,24 @@ main_controller.py
 ===================================================
 Thuat toan dieu khien den giao thong:
 
-  TINH LUU LUONG — PCE (Passenger Car Equivalent)
-    xe may = 0.5 PCE  |  o to = 1.0 PCE
-    flow_pce = moto*0.5 + car*1.0
+    DO DEMAND (ap luc pha)
+        demand = PCE + hang_doi*QUEUE_WEIGHT + avg_wait*WAIT_WEIGHT
+        demand duoc lam muot (EMA) va co bonus cho pha re trai.
 
-  QUYET DINH THOI GIAN XANH — Webster's Formula (1958)
-    Tieu chuan ky thuat giao thong duong bo quoc te.
-    Tinh thoi gian xanh TY LE voi luu luong tung huong:
+    CHU KY ADAPTIVE
+        cycle = MIN_CYCLE + total_demand*CYCLE_EXTRA_PER_DEMAND
+        green_i = min_green + phan_bo_ti_le theo demand
 
-      y_i  = flow_i / S   (S = 1800 PCE/h = bao hoa)
-      C*   = (1.5*L + 5) / (1 - sum(y_i))   chu ky toi uu
-      g_i  = (C* - L) * y_i / sum(y_i)      thoi gian xanh toi uu
-
-    Vi du:
-      Huong NS: 400 PCE/h  -> y=0.22
-      Huong EW: 600 PCE/h  -> y=0.33
-      C* = 60s
-      g_NS = 60 * 0.22/0.55 = 24s
-      g_EW = 60 * 0.33/0.55 = 36s
-
-  DEN VANG 3 GIAY — bat buoc truoc khi doi xanh
-    GREEN --(het g_i)--> YELLOW --(3s)--> GREEN (pha tiep)
+    THU TU PHA
+        Di theo thu tu pha trong tlLogic, tu dong chay pha vang/all-red.
 
 Cach chay:
   python main_controller.py
-  python main_controller.py --mqtt --tls-id J105 --area A --intersection-id 001 \
-    --mqtt-host gaccf6ca.ala.asia-southeast1.emqxsl.com --mqtt-port 8883 \
-    --mqtt-username "<username>" --mqtt-password "<password>"
 """
 
 import argparse
 import json
+import math
 import os
 import ssl
 import sys
@@ -46,15 +33,14 @@ traci = None
 SUMO_BINARY = "sumo-gui"
 SUMO_CONFIG = "sim.sumocfg"
 
-YELLOW_TIME = 3     # giay den vang bat buoc
+# Performance
+USE_LANE_METRICS = False  # Faster, but PCE becomes approximate
 
 # PCE — Passenger Car Equivalent
 PCE_MOTORCYCLE = 0.5
 PCE_CAR        = 1.0
 
-# Webster parameters
-SATURATION_FLOW = 1800   # PCE/gio — luu luong bao hoa (tieu chuan)
-LOST_TIME       = 4      # giay mat mat moi pha (thoi gian khoi dong + giai toa)
+# Cycle parameters
 MIN_GREEN       = 10     # giay — gioi han duoi cho thoi gian xanh
 MAX_GREEN       = 90     # giay — gioi han tren
 MIN_CYCLE       = 30     # giay — chu ky toi thieu
@@ -62,7 +48,26 @@ MAX_CYCLE       = 120    # giay — chu ky toi da
 
 # Gridlock
 GRIDLOCK_THRESHOLD = 0.70
-GRIDLOCK_MIN_GREEN = 20
+
+# Demand smoothing
+DEMAND_SMOOTHING = 0.35
+QUEUE_WEIGHT = 0.8
+WAIT_WEIGHT = 0.03  # Tang neu xe doi lau bi doi qua muc
+CYCLE_EXTRA_PER_DEMAND = 2.0
+LOW_DEMAND = 2.0
+
+# Left-turn protected phases
+TURN_PHASE_DURATION_LIMIT = 12
+TURN_PHASE_GREEN_LIMIT = 2
+TURN_PHASE_BONUS = 2.5
+TURN_PHASE_MIN_GREEN = 15
+TURN_PHASE_LOW_DEMAND = 0.5
+TURN_PHASE_OVERRIDE = {}
+LEFT_TURN_ANGLE_MIN = 0.35
+LEFT_TURN_ANGLE_MAX = 2.8
+TURN_PREEMPT_THRESHOLD = 4.0
+TURN_PREEMPT_RATIO = 1.2
+TURN_PREEMPT_COOLDOWN = 8.0
 
 DASHBOARD_INTERVAL = 20
 
@@ -75,24 +80,15 @@ MQTT_PUBLISH_INTERVAL = 1
 DEFAULT_GROUP_MAP = "1:0,3:0,2:1,4:1"
 MQTT_REALTIME = True
 MQTT_REALTIME_FACTOR = 1.0
-SAFE_SHORTEN_SECONDS = 5
 
 # ─── STATE MACHINE ───────────────────────────────────────────────────────────
 
 STATE_GREEN  = "GREEN"
-STATE_YELLOW = "YELLOW"
+STATE_TRANSITION = "TRANSITION"
 
-
-# ─── MQTT HELPERS ────────────────────────────────────────────────────────────
 
 def parse_group_map(text):
-    """
-    Doc mapping cum den -> thu tu pha xanh.
-
-    Vi du: "1:0,3:0,2:1,4:1"
-      - cum 1 va 3 theo pha xanh thu 0
-      - cum 2 va 4 theo pha xanh thu 1
-    """
+    """Doc mapping cum den -> thu tu pha xanh."""
     result = {}
     for item in text.split(","):
         item = item.strip()
@@ -182,7 +178,7 @@ class MqttPublisher:
             import paho.mqtt.client as mqtt
         except ImportError:
             raise RuntimeError(
-                "Chua cai paho-mqtt. Hay chay: pip install paho-mqtt"
+                "Chua cai paho-mqtt. Hay chay: python -m pip install paho-mqtt"
             )
 
         self.client = mqtt.Client(client_id=self.client_id)
@@ -221,150 +217,187 @@ class MqttPublisher:
 
 # ─── PCE ─────────────────────────────────────────────────────────────────────
 
-def get_edge_pce(edge_id):
+_CACHE_SIM_TIME = None
+_EDGE_CACHE = {}
+_PHASE_CACHE = {}
+
+
+def _reset_cache(sim_time):
+    global _CACHE_SIM_TIME, _EDGE_CACHE, _PHASE_CACHE
+    if sim_time is None:
+        return
+    if _CACHE_SIM_TIME != sim_time:
+        _CACHE_SIM_TIME = sim_time
+        _EDGE_CACHE = {}
+        _PHASE_CACHE = {}
+
+def get_edge_pce(edge_id, sim_time=None):
     """
     Dem xe may va o to tren 1 edge, tinh PCE.
     """
-    moto = car = halting = 0
-    max_wait = 0.0
-    try:
-        for vid in traci.edge.getLastStepVehicleIDs(edge_id):
-            try:
-                vtype = traci.vehicle.getTypeID(vid).lower()
-                speed = traci.vehicle.getSpeed(vid)
-                wait  = traci.vehicle.getWaitingTime(vid)
-                if "motorcycle" in vtype or "moto" in vtype:
-                    moto += 1
-                else:
-                    car += 1
-                if speed < 0.3:
-                    halting += 1
-                if wait > max_wait:
-                    max_wait = wait
-            except traci.TraCIException:
-                car += 1
-    except traci.TraCIException:
-        pass
+    _reset_cache(sim_time)
+    if sim_time is not None and edge_id in _EDGE_CACHE:
+        return _EDGE_CACHE[edge_id]
 
-    pce = moto * PCE_MOTORCYCLE + car * PCE_CAR
-    return {
+    moto = car = halting = 0
+    total_wait = 0.0
+    max_wait = 0.0
+    if USE_LANE_METRICS:
+        vehicles = 0
+        try:
+            lane_count = traci.edge.getLaneNumber(edge_id)
+        except traci.TraCIException:
+            lane_count = 0
+
+        for i in range(lane_count):
+            lane_id = f"{edge_id}_{i}"
+            try:
+                vehicles += traci.lane.getLastStepVehicleNumber(lane_id)
+                halting += traci.lane.getLastStepHaltingNumber(lane_id)
+                total_wait += traci.lane.getWaitingTime(lane_id)
+            except traci.TraCIException:
+                continue
+
+        car = vehicles
+        pce = vehicles * PCE_CAR
+        if vehicles > 0:
+            max_wait = total_wait / vehicles
+    else:
+        try:
+            for vid in traci.edge.getLastStepVehicleIDs(edge_id):
+                try:
+                    vtype = traci.vehicle.getTypeID(vid).lower()
+                    speed = traci.vehicle.getSpeed(vid)
+                    wait  = traci.vehicle.getWaitingTime(vid)
+                    total_wait += wait
+                    if "motorcycle" in vtype or "moto" in vtype:
+                        moto += 1
+                    else:
+                        car += 1
+                    if speed < 0.3:
+                        halting += 1
+                    if wait > max_wait:
+                        max_wait = wait
+                except traci.TraCIException:
+                    car += 1
+        except traci.TraCIException:
+            pass
+
+        pce = moto * PCE_MOTORCYCLE + car * PCE_CAR
+    out = {
         "pce":      pce,
         "moto":     moto,
         "car":      car,
         "halting":  halting,
+        "wait_sum": total_wait,
+        "avg_wait": total_wait / max(moto + car, 1),
         "max_wait": max_wait,
     }
 
+    if sim_time is not None:
+        _EDGE_CACHE[edge_id] = out
+    return out
 
-def get_phase_pce(edges):
+
+def get_phase_pce(edges, sim_time=None):
     """Gop PCE cua nhieu edges thanh 1 pha."""
+    _reset_cache(sim_time)
+    cache_key = tuple(sorted(edges))
+    if sim_time is not None and cache_key in _PHASE_CACHE:
+        return _PHASE_CACHE[cache_key]
+
     total_pce = total_moto = total_car = total_halt = 0
+    total_wait = 0.0
     max_wait  = 0.0
     for edge in edges:
-        d = get_edge_pce(edge)
+        d = get_edge_pce(edge, sim_time)
         total_pce  += d["pce"]
         total_moto += d["moto"]
         total_car  += d["car"]
         total_halt += d["halting"]
+        total_wait += d["wait_sum"]
         if d["max_wait"] > max_wait:
             max_wait = d["max_wait"]
     vehicles   = total_moto + total_car
     halt_ratio = total_halt / max(vehicles, 1)
-    return {
+    out = {
         "pce":        total_pce,
         "moto":       total_moto,
         "car":        total_car,
         "vehicles":   vehicles,
         "halting":    total_halt,
         "halt_ratio": halt_ratio,
+        "wait_sum":   total_wait,
+        "avg_wait":   total_wait / max(vehicles, 1),
         "max_wait":   max_wait,
     }
 
+    if sim_time is not None:
+        _PHASE_CACHE[cache_key] = out
+    return out
 
-# ─── WEBSTER'S FORMULA ───────────────────────────────────────────────────────
 
-def webster(phase_flows_pce_per_hour, n_phases):
+def get_phase_demand(phase_stats):
     """
-    Tinh thoi gian xanh toi uu theo Webster (1958).
+    Tinh ap luc cua 1 pha tu PCE, hang doi va thoi gian cho.
 
-    Tham so:
-      phase_flows_pce_per_hour : list luu luong tung pha (PCE/gio)
-      n_phases                 : so pha
-
-    Tra ve:
-      green_times : list thoi gian xanh (giay) cho tung pha
-      cycle       : chu ky toi uu (giay)
-
-    Cong thuc:
-      y_i = q_i / S              (ti so luu luong/bao hoa)
-      L   = n_phases * LOST_TIME (tong thoi gian mat mat)
-      C*  = (1.5*L + 5) / (1 - sum(y))   chu ky Webster
-      g_i = (C* - L) * (y_i / sum(y))    thoi gian xanh
+    Muc tieu la uu tien pha dang tac, nhung khong de 1 so xe dung im
+    lam khuuch dai green_time qua manh.
     """
-    S = SATURATION_FLOW
-
-    # Tinh y_i cho tung pha
-    y = [q / S for q in phase_flows_pce_per_hour]
-    sum_y = sum(y)
-
-    # Tong thoi gian mat mat
-    L = n_phases * LOST_TIME
-
-    # Tranh chia cho 0 hoac am (qua tai)
-    if sum_y <= 0:
-        # Khong co xe: chia deu thoi gian
-        g = max(MIN_GREEN, MIN_CYCLE // n_phases)
-        return [g] * n_phases, g * n_phases
-
-    if sum_y >= 0.95:
-        # Qua tai (> 95% bao hoa): dung MAX_GREEN
-        return [MAX_GREEN] * n_phases, MAX_GREEN * n_phases
-
-    # Chu ky toi uu Webster
-    cycle = (1.5 * L + 5) / (1 - sum_y)
-    cycle = max(MIN_CYCLE, min(MAX_CYCLE, cycle))
-
-    # Thoi gian xanh tung pha
-    green_times = []
-    for yi in y:
-        if yi <= 0:
-            green_times.append(MIN_GREEN)
-        else:
-            gi = (cycle - L) * (yi / sum_y)
-            gi = max(MIN_GREEN, min(MAX_GREEN, gi))
-            green_times.append(gi)
-
-    return green_times, cycle
+    return (
+        phase_stats["pce"]
+        + phase_stats["halting"] * QUEUE_WEIGHT
+        + phase_stats["avg_wait"] * WAIT_WEIGHT
+    )
 
 
 # ─── CONTROLLER ──────────────────────────────────────────────────────────────
 
 class DensityController:
     """
-    Dieu khien 1 nut den bang Webster's Formula.
+    Dieu khien 1 nut den theo ap luc giao thong (adaptive).
 
     Moi chu ky:
-      1. Do luu luong PCE tung pha (xe/gio)
-      2. Chay Webster -> tinh g_i toi uu cho tung pha
-      3. Chay tung pha theo g_i, vang 3s giua cac pha
+            1. Do ap luc tung pha (PCE + hang doi + cho)
+            2. Cap thoi gian xanh theo ty le ap luc
+            3. Di theo thu tu tlLogic, tu dong chay pha vang/all-red
     """
 
     def __init__(self, tls_id):
         self.tls_id       = tls_id
         self.state        = STATE_GREEN
         self.switch_count = 0
-        self.yellow_start = None
-
         logic = traci.trafficlight.getAllProgramLogics(tls_id)[0]
         self.all_phases  = logic.phases
         self.num_phases  = len(logic.phases)
+        self.phase_durations = [p.duration for p in self.all_phases]
+        self.phase_green_counts = [sum(1 for c in p.state if c in ('G', 'g'))
+                                   for p in self.all_phases]
         self.green_phases = [
             i for i, p in enumerate(logic.phases)
             if 'G' in p.state or 'g' in p.state
         ]
-
+        self.green_index = {gp: i for i, gp in enumerate(self.green_phases)}
         # Map pha -> edges
         links = traci.trafficlight.getControlledLinks(tls_id)
+        self.left_turn_signals = self._infer_left_turn_signals(links)
+        self.turn_phases = set()
+        if self.left_turn_signals:
+            for gp in self.green_phases:
+                greens = {idx for idx, c in enumerate(self.all_phases[gp].state)
+                          if c in ('G', 'g')}
+                if greens and greens.issubset(self.left_turn_signals):
+                    self.turn_phases.add(gp)
+
+        if not self.turn_phases:
+            self.turn_phases = {
+                i for i in self.green_phases
+                if self.phase_durations[i] <= TURN_PHASE_DURATION_LIMIT
+                and self.phase_green_counts[i] <= TURN_PHASE_GREEN_LIMIT
+            }
+        override = TURN_PHASE_OVERRIDE.get(tls_id)
+        if override:
+            self.turn_phases.update(set(override))
         self.phase_edges = {}
         for gp in self.green_phases:
             edges = set()
@@ -376,19 +409,26 @@ class DensityController:
 
         self.cur_idx     = 0
         self.green_start = traci.simulation.getTime()
-
-        # Khoi tao thoi gian xanh bang nhau
-        self.green_times = [MIN_GREEN] * len(self.green_phases)
+        self.phase_demand_ema = {gp: None for gp in self.green_phases}
+        self.transition_seq = []
+        self.transition_pos = 0
+        self.transition_start = None
+        self.transition_target = None
+        self.last_turn_time = -1.0
         self.plan_seq = 0
         self.plan_id = ""
         self.plan_started_sim = self.green_start
-        self.plan_duration = self._target_green()
+        self.plan_duration = MIN_GREEN
         self.plan_generated_wall_ms = now_wall_ms()
         self.plan_generated_sim = self.green_start
         self.plan_abrupt = False
         self.plan_reason = "initial"
 
+        # Khoi tao thoi gian xanh bang nhau
+        self.green_times = [MIN_GREEN] * len(self.green_phases)
+
         traci.trafficlight.setPhase(tls_id, self.green_phases[0])
+        self._update_plan(self.green_start)
         self._start_plan(
             self.green_start,
             self._target_green(),
@@ -396,8 +436,8 @@ class DensityController:
             reason="initial_green",
         )
 
-        print("  [TLS %s] %d pha | Webster S=%d PCE/h L=%ds" % (
-            tls_id, len(self.green_phases), SATURATION_FLOW, LOST_TIME))
+        print("  [TLS %s] %d pha (adaptive)" % (
+            tls_id, len(self.green_phases)))
         for gp in self.green_phases:
             print("    Pha %d: %s" % (gp, self.phase_edges[gp]))
 
@@ -412,10 +452,16 @@ class DensityController:
     def _target_green(self):
         return self.green_times[self.cur_idx]
 
+    def _phase_min_green(self, phase_idx):
+        min_green = MIN_GREEN
+        if phase_idx in self.turn_phases:
+            min_green = max(min_green, TURN_PHASE_MIN_GREEN)
+        return min_green
+
     def _start_plan(self, sim_time, duration, abrupt=False, reason="normal"):
         self.plan_seq += 1
         self.plan_started_sim = sim_time
-        self.plan_duration = max(0, float(duration))
+        self.plan_duration = max(0.0, float(duration))
         self.plan_generated_wall_ms = now_wall_ms()
         self.plan_generated_sim = sim_time
         self.plan_abrupt = abrupt
@@ -426,53 +472,28 @@ class DensityController:
             self.plan_seq,
         )
 
-    def _shorten_current_green(self, sim_time, safe_remaining, reason):
-        elapsed = self._elapsed(sim_time)
-        old_target = self._target_green()
-        new_target = elapsed + safe_remaining
-
-        if new_target >= old_target:
-            return False
-
-        self.green_times[self.cur_idx] = new_target
-        self._start_plan(
-            self.green_start,
-            new_target,
-            abrupt=True,
-            reason=reason,
-        )
-        print("  [SHORTEN %s] P%d %.0fs -> %.0fs | remaining=%.0fs | %s" % (
-            self.tls_id,
-            self._cur_green(),
-            old_target,
-            new_target,
-            safe_remaining,
-            reason,
-        ))
-        return True
-
-    def get_remaining_seconds(self, sim_time):
-        return int(round(self.get_remaining_ms(sim_time) / 1000))
-
     def get_remaining_ms(self, sim_time):
-        if self.state == STATE_YELLOW:
-            elapsed = sim_time - (self.yellow_start or sim_time)
-            return max(0, int(round((YELLOW_TIME - elapsed) * 1000)))
+        if self.state == STATE_TRANSITION and self.transition_seq:
+            _, duration = self.transition_seq[self.transition_pos]
+            elapsed = sim_time - (self.transition_start or sim_time)
+            return max(0, int(round((duration - elapsed) * 1000)))
 
         elapsed = self._elapsed(sim_time)
         return max(0, int(round((self._target_green() - elapsed) * 1000)))
 
+    def get_remaining_seconds(self, sim_time):
+        return int(round(self.get_remaining_ms(sim_time) / 1000))
+
     def build_mqtt_payload(self, sim_time, area, intersection_id, group_map, seq):
         remaining_ms = self.get_remaining_ms(sim_time)
         remaining = int(round(remaining_ms / 1000))
-        sent_wall_ms = now_wall_ms()
         current_phase = traci.trafficlight.getPhase(self.tls_id)
         groups = []
 
         for group_id in sorted(group_map):
             phase_idx = group_map[group_id]
             if phase_idx == self.cur_idx:
-                color = "yellow" if self.state == STATE_YELLOW else "green"
+                color = "yellow" if self.state == STATE_TRANSITION else "green"
             else:
                 color = "red"
 
@@ -488,7 +509,7 @@ class DensityController:
             "tls_id": self.tls_id,
             "sim_time": int(round(sim_time)),
             "seq": seq,
-            "sent_wall_ms": sent_wall_ms,
+            "sent_wall_ms": now_wall_ms(),
             "plan_id": self.plan_id,
             "plan_seq": self.plan_seq,
             "plan_reason": self.plan_reason,
@@ -503,25 +524,177 @@ class DensityController:
             "groups": groups,
         }
 
-    # ── Cap nhat Webster moi chu ky ──────────────────────────────────────────
+    def _lane_heading(self, lane_id, use_end):
+        try:
+            shape = traci.lane.getShape(lane_id)
+        except traci.TraCIException:
+            return None
+        if len(shape) < 2:
+            return None
 
-    def _update_webster(self):
+        if use_end:
+            p1, p2 = shape[-2], shape[-1]
+        else:
+            p1, p2 = shape[0], shape[1]
+        return math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+
+    def _is_left_turn_link(self, from_lane, to_lane):
+        from_heading = self._lane_heading(from_lane, True)
+        to_heading = self._lane_heading(to_lane, False)
+        if from_heading is None or to_heading is None:
+            return False
+
+        diff = to_heading - from_heading
+        while diff <= -math.pi:
+            diff += 2 * math.pi
+        while diff > math.pi:
+            diff -= 2 * math.pi
+        return LEFT_TURN_ANGLE_MIN <= diff <= LEFT_TURN_ANGLE_MAX
+
+    def _infer_left_turn_signals(self, links):
+        left_signals = set()
+        for idx, link_set in enumerate(links):
+            for link in link_set:
+                if len(link) < 2:
+                    continue
+                from_lane, to_lane = link[0], link[1]
+                if self._is_left_turn_link(from_lane, to_lane):
+                    left_signals.add(idx)
+                    break
+        return left_signals
+
+    def _build_transition_sequence(self, start_phase, target_phase):
+        if start_phase == target_phase:
+            return []
+
+        seq = []
+        phase_idx = (start_phase + 1) % self.num_phases
+        while phase_idx != target_phase:
+            seq.append((phase_idx, self.phase_durations[phase_idx]))
+            phase_idx = (phase_idx + 1) % self.num_phases
+            if phase_idx == start_phase:
+                break
+        return seq
+
+    def _start_green(self, sim_time):
+        self.green_start = sim_time
+        self.state = STATE_GREEN
+        traci.trafficlight.setPhase(self.tls_id, self._cur_green())
+        self._update_plan(sim_time)
+        self._start_plan(
+            sim_time,
+            self._target_green(),
+            abrupt=False,
+            reason="new_green",
+        )
+        if self._cur_green() in self.turn_phases:
+            self.last_turn_time = sim_time
+
+    def _start_transition_to(self, sim_time, target_phase):
+        cur_green = self._cur_green()
+        if target_phase == cur_green:
+            return
+
+        transition = self._build_transition_sequence(cur_green, target_phase)
+        if not transition:
+            self.cur_idx = self.green_index.get(target_phase, self.cur_idx)
+            self._start_green(sim_time)
+            return
+
+        self.transition_seq = transition
+        self.transition_pos = 0
+        self.transition_start = sim_time
+        self.transition_target = target_phase
+        self.state = STATE_TRANSITION
+        traci.trafficlight.setPhase(self.tls_id, self.transition_seq[0][0])
+        self._start_plan(
+            sim_time,
+            self.transition_seq[0][1],
+            abrupt=False,
+            reason="transition",
+        )
+
+    def _best_turn_phase(self, sim_time):
+        best_phase = None
+        best_demand = 0.0
+        for gp in self.turn_phases:
+            pce_data = get_phase_pce(self.phase_edges[gp], sim_time)
+            demand = get_phase_demand(pce_data) * TURN_PHASE_BONUS
+            if demand > best_demand:
+                best_demand = demand
+                best_phase = gp
+        return best_phase, best_demand
+
+    def _select_next_phase(self, sim_time, cur_demand):
+        if not self.green_phases:
+            return None
+
+        next_idx = (self.cur_idx + 1) % len(self.green_phases)
+        default_next = self.green_phases[next_idx]
+
+        if not self.turn_phases or self._cur_green() in self.turn_phases:
+            return default_next
+
+        best_turn, turn_demand = self._best_turn_phase(sim_time)
+        if best_turn is None:
+            return default_next
+
+        if sim_time - self.last_turn_time < TURN_PREEMPT_COOLDOWN:
+            return default_next
+
+        if turn_demand < TURN_PREEMPT_THRESHOLD:
+            return default_next
+
+        if turn_demand >= cur_demand * TURN_PREEMPT_RATIO or cur_demand <= LOW_DEMAND:
+            return best_turn
+
+        return default_next
+
+    # ── Cap nhat plan moi chu ky ─────────────────────────────────────────────
+
+    def _update_plan(self, sim_time):
         """
-        Do luu luong hien tai, tinh lai thoi gian xanh toi uu.
+        Cap nhat green time theo ap luc (demand) cua tung pha.
         Goi 1 lan moi khi bat dau pha xanh moi.
         """
-        # Do luu luong tung pha (PCE/buoc) -> quy doi sang PCE/gio
-        # SUMO step = 1s, nhan 3600 de ra PCE/gio
-        flows_per_hour = []
+        demands = {}
+        min_green = {}
         for gp in self.green_phases:
-            pce_data = get_phase_pce(self.phase_edges[gp])
-            # PCE hien tai tren edge * 3600 = luong xe uoc tinh moi gio
-            flows_per_hour.append(pce_data["pce"] * 3600 / 60)
+            pce_data = get_phase_pce(self.phase_edges[gp], sim_time)
+            demand = get_phase_demand(pce_data)
+            if gp in self.turn_phases:
+                demand *= TURN_PHASE_BONUS
 
-        # Chay Webster
-        self.green_times, cycle = webster(flows_per_hour, len(self.green_phases))
+            prev = self.phase_demand_ema[gp]
+            if prev is None:
+                ema = demand
+            else:
+                ema = prev * (1 - DEMAND_SMOOTHING) + demand * DEMAND_SMOOTHING
 
-        print("  [Webster %s] cycle=%.0fs | %s" % (
+            self.phase_demand_ema[gp] = ema
+            demands[gp] = max(0.0, ema)
+            min_green[gp] = self._phase_min_green(gp)
+
+        total_demand = sum(demands.values())
+        total_min = sum(min_green.values())
+        cycle = MIN_CYCLE + total_demand * CYCLE_EXTRA_PER_DEMAND
+        cycle = max(total_min, cycle)
+        if total_min <= MAX_CYCLE:
+            cycle = min(cycle, MAX_CYCLE)
+        cycle = max(MIN_CYCLE, cycle)
+
+        remaining = max(0.0, cycle - total_min)
+        self.green_times = []
+        for gp in self.green_phases:
+            if total_demand > 0:
+                extra = remaining * demands[gp] / total_demand
+            else:
+                extra = 0.0
+            target = min_green[gp] + extra
+            target = max(min_green[gp], min(MAX_GREEN, target))
+            self.green_times.append(target)
+
+        print("  [PLAN %s] cycle=%.0fs | %s" % (
             self.tls_id,
             cycle,
             " | ".join("P%d=%.0fs" % (self.green_phases[i], self.green_times[i])
@@ -529,40 +702,50 @@ class DensityController:
 
     # ── Step chinh ───────────────────────────────────────────────────────────
 
-    def step(self, sim_time, is_gridlock, safe_shorten_seconds=SAFE_SHORTEN_SECONDS):
+    def step(self, sim_time):
 
-        # ── DANG VANG: cho du 3 giay ─────────────────────────────────────────
-        if self.state == STATE_YELLOW:
-            if sim_time - self.yellow_start >= YELLOW_TIME:
-                # Sang pha xanh tiep theo
-                self.cur_idx    = (self.cur_idx + 1) % len(self.green_phases)
-                self.green_start = sim_time
-                self.state       = STATE_GREEN
-                traci.trafficlight.setPhase(self.tls_id, self._cur_green())
+        # ── DANG CHUYEN PHA: chay theo duration trong tlLogic ───────────────
+        if self.state == STATE_TRANSITION:
+            if not self.transition_seq:
+                self.state = STATE_GREEN
+                return
 
-                # Cap nhat Webster cho chu ky moi
-                self._update_webster()
-                self._start_plan(
-                    sim_time,
-                    self._target_green(),
-                    abrupt=False,
-                    reason="new_green",
-                )
-
-                print("  🟢 %s P%d XANH %.0fs (Webster)" % (
-                    self.tls_id, self._cur_green(), self._target_green()))
+            phase_idx, duration = self.transition_seq[self.transition_pos]
+            if sim_time - self.transition_start >= duration:
+                self.transition_pos += 1
+                if self.transition_pos >= len(self.transition_seq):
+                    if self.transition_target is not None:
+                        self.cur_idx = self.green_index.get(self.transition_target, self.cur_idx)
+                    else:
+                        self.cur_idx = (self.cur_idx + 1) % len(self.green_phases)
+                    self._start_green(sim_time)
+                else:
+                    phase_idx, _ = self.transition_seq[self.transition_pos]
+                    self.transition_start = sim_time
+                    traci.trafficlight.setPhase(self.tls_id, phase_idx)
+                    self._start_plan(
+                        sim_time,
+                        self.transition_seq[self.transition_pos][1],
+                        abrupt=False,
+                        reason="transition",
+                    )
             return
 
-        # ── DANG XANH: kiem tra het thoi gian Webster chua ───────────────────
+        # ── DANG XANH: kiem tra het thoi gian target chua ────────────────────
         elapsed    = self._elapsed(sim_time)
         target     = self._target_green()
-        min_green  = GRIDLOCK_MIN_GREEN if is_gridlock else MIN_GREEN
+        min_green  = self._phase_min_green(self._cur_green())
 
         # Chua du MIN_GREEN -> giu nguyen
         if elapsed < min_green:
             return
 
-        pce = get_phase_pce(self.phase_edges[self._cur_green()])
+        pce = get_phase_pce(self.phase_edges[self._cur_green()], sim_time)
+        demand = get_phase_demand(pce)
+        if self._cur_green() in self.turn_phases:
+            demand *= TURN_PHASE_BONUS
+        low_demand = TURN_PHASE_LOW_DEMAND if self._cur_green() in self.turn_phases else LOW_DEMAND
+        preferred_next = self._select_next_phase(sim_time, demand)
 
         should_switch = False
         reason        = ""
@@ -572,49 +755,40 @@ class DensityController:
             should_switch = True
             reason = "MAX_GREEN %ds" % MAX_GREEN
 
-        # 2. Pha trong: khong co xe
-        elif pce["vehicles"] == 0 and elapsed >= min_green and elapsed < target:
-            remaining = target - elapsed
-            if remaining > safe_shorten_seconds:
-                self._shorten_current_green(
-                    sim_time,
-                    safe_shorten_seconds,
-                    "pha trong",
-                )
-                return
+        # 2. Pha yeu: it xe / khong co hang doi
+        elif (pce["vehicles"] == 0 or demand <= low_demand) and elapsed >= min_green:
+            should_switch = True
+            reason = "pha yeu"
 
-        # 3. Webster: het thoi gian xanh toi uu
+        # 3. Het thoi gian xanh toi uu
         elif elapsed >= target:
             should_switch = True
-            reason = ("Webster g=%.0fs elapsed=%.0fs | "
+            reason = ("Plan g=%.0fs elapsed=%.0fs | "
                       "moto=%d(%.1fPCE) car=%d(%.1fPCE) total=%.1fPCE") % (
                 target, elapsed,
                 pce["moto"], pce["moto"] * PCE_MOTORCYCLE,
                 pce["car"],  pce["car"]  * PCE_CAR,
                 pce["pce"])
 
-        # ── Bat den vang 3 giay ───────────────────────────────────────────────
+        if not should_switch and preferred_next is not None and preferred_next != self._cur_green():
+            if elapsed >= min_green and preferred_next in self.turn_phases:
+                should_switch = True
+                reason = "turn preempt"
+
+        # ── Bat chuyen pha ───────────────────────────────────────────────────
         if should_switch:
-            yellow_idx = (self._cur_green() + 1) % self.num_phases
-            traci.trafficlight.setPhase(self.tls_id, yellow_idx)
-            self.state        = STATE_YELLOW
-            self.yellow_start = sim_time
             self.switch_count += 1
-            self._start_plan(
-                sim_time,
-                YELLOW_TIME,
-                abrupt=False,
-                reason="yellow_after_%s" % reason,
-            )
-            print("  🟡 %s VANG 3s | %s" % (self.tls_id, reason))
+            target_phase = preferred_next if preferred_next is not None else self._cur_green()
+            self._start_transition_to(sim_time, target_phase)
+            print("  TRANSITION %s | %s" % (self.tls_id, reason))
 
     # ── Status ───────────────────────────────────────────────────────────────
 
-    def get_status(self):
+    def get_status(self, sim_time=None):
         cur = traci.trafficlight.getPhase(self.tls_id)
         out = []
         for i, gp in enumerate(self.green_phases):
-            pce = get_phase_pce(self.phase_edges[gp])
+            pce = get_phase_pce(self.phase_edges[gp], sim_time)
             out.append({
                 "phase":    gp,
                 "pce":      pce,
@@ -649,7 +823,7 @@ def print_dashboard(sim_time, controllers, is_gridlock, waiting, total):
     print("  " + "-"*78)
 
     for tls_id, ctrl in controllers.items():
-        for s in ctrl.get_status():
+        for s in ctrl.get_status(sim_time):
             p      = s["pce"]
             marker = "<XANH" if s["is_green"] else "     "
             state  = s["state"] if s["is_green"] else ""
@@ -686,7 +860,7 @@ def build_parser():
     load_dotenv()
 
     parser = argparse.ArgumentParser(
-        description="Webster traffic controller with optional MQTT publisher"
+        description="Adaptive demand traffic controller with optional MQTT publisher"
     )
     parser.add_argument("--sumo-binary", default=os.getenv("SUMO_BINARY", SUMO_BINARY))
     parser.add_argument("--sumo-config", default=os.getenv("SUMO_CONFIG", SUMO_CONFIG))
@@ -744,12 +918,6 @@ def build_parser():
         default=os.getenv("GROUP_MAP", DEFAULT_GROUP_MAP),
         help='Mapping cum den -> index pha xanh, vi du "1:0,3:0,2:1,4:1"',
     )
-    parser.add_argument(
-        "--safe-shorten-seconds",
-        type=float,
-        default=float(os.getenv("SAFE_SHORTEN_SECONDS", SAFE_SHORTEN_SECONDS)),
-        help="Nguong rut ngan an toan khi pha trong",
-    )
     return parser
 
 
@@ -803,14 +971,11 @@ def run(args):
     traci = traci_module
 
     print("=" * 65)
-    print("  Webster's Formula Traffic Controller")
+    print("  Adaptive Demand Traffic Controller")
     print("=" * 65)
     print("  Luu luong : PCE  (moto=%.1f  car=%.1f)" % (
         PCE_MOTORCYCLE, PCE_CAR))
-    print("  Thuat toan: Webster 1958")
-    print("    S=%d PCE/h | L=%ds/pha" % (SATURATION_FLOW, LOST_TIME))
-    print("    g_i = (C* - L) * y_i / sum(y)")
-    print("  Den vang  : %ds bat buoc" % YELLOW_TIME)
+    print("  Thuat toan: Adaptive demand")
     print("  Green     : %ds - %ds" % (MIN_GREEN, MAX_GREEN))
     print("")
 
@@ -874,7 +1039,7 @@ def run(args):
 
             for ctrl in controllers.values():
                 try:
-                    ctrl.step(sim_time, is_gridlock, args.safe_shorten_seconds)
+                    ctrl.step(sim_time)
                 except Exception:
                     pass
 
