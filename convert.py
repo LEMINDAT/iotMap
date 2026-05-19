@@ -23,9 +23,9 @@ END_TIME = 15000      # ~4.17 giờ (15000 giây)
 
 # Tần suất (càng lớn càng ít xe)
 p_motor_peak = 2      # xe máy (peak - cao điểm)
-p_motor_offpeak = 10   # xe máy (off-peak - không cao điểm)
-p_car_peak = 6        # ô tô (peak)
-p_car_offpeak = 15     # ô tô (off-peak)
+p_motor_offpeak = 8   # xe máy (off-peak - không cao điểm)
+p_car_peak = 5        # ô tô (peak)
+p_car_offpeak =  16    # ô tô (off-peak)
 
 # Scale traffic volume by map width. These base periods are tuned for the
 # current map.net.xml width: 266.39 - 24.32 = 242.07m.
