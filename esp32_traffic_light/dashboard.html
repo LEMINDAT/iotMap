@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Traffic Light IoT Dashboard</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d9dde4;
+      --text: #1c2430;
+      --muted: #687386;
+      --green: #1e9e63;
+      --yellow: #c58b16;
+      --red: #cf3d32;
+      --blue: #2d6cdf;
+      --gray: #8b95a5;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 14px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .sub {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .conn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #fbfcfd;
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--gray);
+      display: inline-block;
+    }
+
+    .dot.ok { background: var(--green); }
+    .dot.warn { background: var(--yellow); }
+    .dot.bad { background: var(--red); }
+
+    main {
+      padding: 20px 24px 28px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(150px, 1fr));
+      gap: 12px;
+    }
+
+    .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 12px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .metric-value {
+      margin-top: 6px;
+      font-size: 24px;
+      font-weight: 700;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    th, td {
+      padding: 11px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+    }
+
+    th {
+      color: var(--muted);
+      background: #fbfcfd;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 12px;
+      font-weight: 700;
+      background: #f8fafc;
+      white-space: nowrap;
+    }
+
+    .badge.ok {
+      color: var(--green);
+      border-color: rgba(30, 158, 99, .3);
+      background: rgba(30, 158, 99, .08);
+    }
+
+    .badge.warn {
+      color: var(--yellow);
+      border-color: rgba(197, 139, 22, .35);
+      background: rgba(197, 139, 22, .1);
+    }
+
+    .badge.bad {
+      color: var(--red);
+      border-color: rgba(207, 61, 50, .35);
+      background: rgba(207, 61, 50, .09);
+    }
+
+    .lights {
+      display: flex;
+      gap: 6px;
+      min-width: 132px;
+    }
+
+    .lamp {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      border: 1px solid rgba(0,0,0,.15);
+      background: #d9dde4;
+      box-shadow: inset 0 -2px 4px rgba(0,0,0,.15);
+    }
+
+    .lamp.red { background: #e55348; }
+    .lamp.yellow { background: #f1c94b; }
+    .lamp.green { background: #38b86f; }
+
+    .small {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .mono {
+      font-family: Consolas, Monaco, monospace;
+      font-size: 12px;
+    }
+
+    @media (max-width: 900px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .toolbar {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      table {
+        display: block;
+        overflow-x: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Traffic Light IoT Dashboard</h1>
+      <div class="sub">Khu vực A - giám sát 5 trạm đèn giao thông qua MQTT</div>
+    </div>
+    <div class="conn">
+      <span id="brokerDot" class="dot"></span>
+      <span id="brokerText">Đang kết nối broker...</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="toolbar">
+      <div class="metric">
+        <div class="metric-label">Tổng trạm</div>
+        <div id="totalStations" class="metric-value">5</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Đang ổn định</div>
+        <div id="okCount" class="metric-value">0</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Cảnh báo</div>
+        <div id="warnCount" class="metric-value">0</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Mất kết nối</div>
+        <div id="offlineCount" class="metric-value">5</div>
+      </div>
+    </section>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Trạm</th>
+          <th>TLS</th>
+          <th>Trạng thái</th>
+          <th>Chế độ</th>
+          <th>Đèn hiện tại</th>
+          <th>Còn lại</th>
+          <th>RSSI</th>
+          <th>Lệnh cuối</th>
+          <th>Plan</th>
+          <th>Cập nhật</th>
+        </tr>
+      </thead>
+      <tbody id="stationRows"></tbody>
+    </table>
+  </main>
+
+  <script>
+    const MQTT_URL = "wss://gaccf6ca.ala.asia-southeast1.emqxsl.com:8084/mqtt";
+    const MQTT_USERNAME = "emqx_online_test_b9e4d5f9";
+    const MQTT_PASSWORD = "fK77ab_d-0dYa372JLb6c5fW14]c2f=d";
+    const AREA = "A";
+    const STATION_IDS = ["001", "002", "003", "004", "005"];
+
+    const stations = new Map(STATION_IDS.map((id) => [id, {
+      id,
+      tls_id: id === "001" ? "J105" : "-",
+      status: "unknown",
+      mode: "UNKNOWN",
+      current_plan_id: "-",
+      last_command_age_ms: null,
+      fallback_active: false,
+      pending_plan: false,
+      rssi: null,
+      lastSeen: null,
+      remaining_seconds: null,
+      groups: [],
+    }]));
+
+    const rows = document.getElementById("stationRows");
+    const brokerDot = document.getElementById("brokerDot");
+    const brokerText = document.getElementById("brokerText");
+
+    function topicStation(topic) {
+      const parts = topic.split("/");
+      if (parts.length < 4 || parts[0] !== "traffic" || parts[1] !== AREA) return null;
+      return { id: parts[2], kind: parts[3] };
+    }
+
+    function ageText(ts) {
+      if (!ts) return "-";
+      const sec = Math.max(0, Math.round((Date.now() - ts) / 1000));
+      if (sec < 60) return sec + "s";
+      return Math.floor(sec / 60) + "m " + (sec % 60) + "s";
+    }
+
+    function commandAgeText(ms) {
+      if (ms === null || ms === undefined) return "-";
+      if (ms < 1000) return ms + "ms";
+      return (ms / 1000).toFixed(1) + "s";
+    }
+
+    function classify(station) {
+      const stale = !station.lastSeen || Date.now() - station.lastSeen > 15000;
+      if (station.status === "offline" || stale) return ["OFFLINE", "bad"];
+      if (station.mode === "LOCAL_FALLBACK" || station.fallback_active || station.pending_plan) {
+        return ["WARNING", "warn"];
+      }
+      if (station.status === "online" && station.mode === "REMOTE") return ["OK", "ok"];
+      return ["WARNING", "warn"];
+    }
+
+    function renderLights(groups) {
+      if (!groups || groups.length === 0) {
+        return '<span class="small">Chưa có dữ liệu</span>';
+      }
+      return '<div class="lights">' + groups
+        .sort((a, b) => Number(a.id) - Number(b.id))
+        .map((g) => `<span title="Cụm ${g.id}: ${g.color}" class="lamp ${g.color || ""}"></span>`)
+        .join("") + '</div>';
+    }
+
+    function render() {
+      let ok = 0;
+      let warn = 0;
+      let offline = 0;
+
+      rows.innerHTML = "";
+      for (const station of stations.values()) {
+        const [label, level] = classify(station);
+        if (level === "ok") ok++;
+        else if (level === "warn") warn++;
+        else offline++;
+
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><strong>${AREA}/${station.id}</strong></td>
+          <td>${station.tls_id || "-"}</td>
+          <td><span class="badge ${level}"><span class="dot ${level}"></span>${label}</span></td>
+          <td>${station.mode || "-"}</td>
+          <td>${renderLights(station.groups)}</td>
+          <td>${station.remaining_seconds === null ? "-" : station.remaining_seconds + "s"}</td>
+          <td>${station.rssi === null ? "-" : station.rssi + " dBm"}</td>
+          <td>${commandAgeText(station.last_command_age_ms)}</td>
+          <td class="mono">${station.current_plan_id || "-"}</td>
+          <td>${ageText(station.lastSeen)}</td>
+        `;
+        rows.appendChild(tr);
+      }
+
+      document.getElementById("okCount").textContent = ok;
+      document.getElementById("warnCount").textContent = warn;
+      document.getElementById("offlineCount").textContent = offline;
+    }
+
+    function updateStation(id, patch) {
+      if (!stations.has(id)) {
+        stations.set(id, {
+          id,
+          tls_id: "-",
+          status: "unknown",
+          mode: "UNKNOWN",
+          current_plan_id: "-",
+          last_command_age_ms: null,
+          fallback_active: false,
+          pending_plan: false,
+          rssi: null,
+          lastSeen: null,
+          remaining_seconds: null,
+          groups: [],
+        });
+      }
+      Object.assign(stations.get(id), patch, { lastSeen: Date.now() });
+      render();
+    }
+
+    function handleMessage(topic, payload) {
+      const meta = topicStation(topic);
+      if (!meta) return;
+
+      let data;
+      try {
+        data = JSON.parse(payload);
+      } catch {
+        return;
+      }
+
+      if (meta.kind === "status") {
+        updateStation(meta.id, {
+          status: data.status || "unknown",
+          tls_id: data.tls_id || stations.get(meta.id)?.tls_id || "-",
+        });
+      } else if (meta.kind === "telemetry") {
+        updateStation(meta.id, {
+          status: "online",
+          tls_id: data.tls_id || stations.get(meta.id)?.tls_id || "-",
+          mode: data.mode || "UNKNOWN",
+          current_plan_id: data.current_plan_id || "-",
+          last_command_age_ms: data.last_command_age_ms,
+          fallback_active: Boolean(data.fallback_active),
+          pending_plan: Boolean(data.pending_plan),
+          rssi: data.rssi ?? null,
+        });
+      } else if (meta.kind === "state") {
+        updateStation(meta.id, {
+          status: "online",
+          tls_id: data.tls_id || stations.get(meta.id)?.tls_id || "-",
+          current_plan_id: data.plan_id || stations.get(meta.id)?.current_plan_id || "-",
+          remaining_seconds: data.remaining_seconds ?? null,
+          groups: Array.isArray(data.groups) ? data.groups : [],
+        });
+      }
+    }
+
+    render();
+    setInterval(render, 1000);
+
+    const client = mqtt.connect(MQTT_URL, {
+      username: MQTT_USERNAME,
+      password: MQTT_PASSWORD,
+      clean: true,
+      reconnectPeriod: 2000,
+      connectTimeout: 10000,
+      clientId: "dashboard-A-" + Math.random().toString(16).slice(2),
+    });
+
+    client.on("connect", () => {
+      brokerDot.className = "dot ok";
+      brokerText.textContent = "Broker connected";
+      client.subscribe(`traffic/${AREA}/+/status`);
+      client.subscribe(`traffic/${AREA}/+/telemetry`);
+      client.subscribe(`traffic/${AREA}/+/state`);
+    });
+
+    client.on("reconnect", () => {
+      brokerDot.className = "dot warn";
+      brokerText.textContent = "Đang reconnect broker...";
+    });
+
+    client.on("error", () => {
+      brokerDot.className = "dot bad";
+      brokerText.textContent = "Broker error";
+    });
+
+    client.on("offline", () => {
+      brokerDot.className = "dot bad";
+      brokerText.textContent = "Broker offline";
+    });
+
+    client.on("message", (topic, message) => {
+      handleMessage(topic, message.toString());
+    });
+  </script>
+</body>
+</html>

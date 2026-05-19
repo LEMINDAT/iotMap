@@ -43,6 +43,16 @@ Outputs are active-high. Use suitable transistor/MOSFET/relay driver hardware fo
 | Local | 4 | On while the fixed local fallback cycle is controlling the lamps |
 | Plan | 16 | Solid while following a broker plan, double-pulse when a broker plan is queued until the next fallback cycle boundary |
 
+## Dashboard
+
+Open `dashboard.html` in a browser to monitor 5 stations in area A. It connects to EMQX over secure WebSocket port `8084` and subscribes:
+
+```text
+traffic/A/+/status
+traffic/A/+/telemetry
+traffic/A/+/state
+```
+
 ## Matching Python Command
 
 ```powershell

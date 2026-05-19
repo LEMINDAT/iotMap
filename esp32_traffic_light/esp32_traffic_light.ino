@@ -15,6 +15,10 @@
 #define MQTT_PASSWORD "fK77ab_d-0dYa372JLb6c5fW14]c2f=d"
 
 #define MQTT_TOPIC "traffic/A/001/state"
+#define MQTT_STATUS_TOPIC "traffic/A/001/status"
+#define MQTT_TELEMETRY_TOPIC "traffic/A/001/telemetry"
+#define DEVICE_ID "A-001"
+#define TLS_ID "J105"
 
 // System status LEDs.
 #define LED_WIFI_PIN 2
@@ -52,11 +56,13 @@ unsigned long lastWiFiAttemptMs = 0;
 bool wifiConnectStarted = false;
 bool wifiWasConnected = false;
 
-// Cải tiến NTP bất đồng bộ
+// Non-blocking NTP sync state.
 bool timeSyncRequested = false;
+bool timeSynced = false;
 unsigned long lastTimeSyncCheckMs = 0;
 
 unsigned long mqttRxPulseUntilMs = 0;
+unsigned long lastTelemetryMs = 0;
 
 struct PendingRemotePlan {
   bool active;
@@ -76,6 +82,7 @@ const unsigned long FALLBACK_YELLOW_MS = 5000;
 const unsigned long REMOTE_PLAN_GRACE_MS = 1500;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long MQTT_RX_PULSE_MS = 120;
+const unsigned long TELEMETRY_INTERVAL_MS = 5000;
 
 void writeLed(uint8_t pin, bool activeHigh, bool on) {
   digitalWrite(pin, on == activeHigh ? HIGH : LOW);
@@ -103,6 +110,65 @@ bool doublePulsePattern() {
 
 void markMqttRx() {
   mqttRxPulseUntilMs = millis() + MQTT_RX_PULSE_MS;
+}
+
+const char *currentMode() {
+  if (fallbackActive) {
+    return "LOCAL_FALLBACK";
+  }
+  if (remotePlanActive) {
+    return "REMOTE";
+  }
+  return "STARTING";
+}
+
+void publishStatus(const char *status) {
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  StaticJsonDocument<192> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["tls_id"] = TLS_ID;
+  doc["status"] = status;
+  doc["uptime_ms"] = millis();
+
+  char buffer[192];
+  size_t len = serializeJson(doc, buffer);
+  mqttClient.publish(MQTT_STATUS_TOPIC, buffer, len, true);
+}
+
+void publishTelemetry() {
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["tls_id"] = TLS_ID;
+  doc["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+  doc["mqtt_connected"] = mqttClient.connected();
+  doc["mode"] = currentMode();
+  doc["current_plan_id"] = currentPlanId;
+  doc["last_command_age_ms"] = millis() - lastPayloadMs;
+  doc["fallback_active"] = fallbackActive;
+  doc["pending_plan"] = pendingRemotePlan.active;
+  doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  doc["uptime_ms"] = millis();
+  doc["free_heap"] = ESP.getFreeHeap();
+  doc["time_synced"] = timeSynced;
+
+  char buffer[512];
+  size_t len = serializeJson(doc, buffer);
+  mqttClient.publish(MQTT_TELEMETRY_TOPIC, buffer, len, false);
+}
+
+void maintainTelemetry() {
+  const unsigned long now = millis();
+  if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryMs = now;
+    publishTelemetry();
+  }
 }
 
 void updateStatusIndicators() {
@@ -249,6 +315,7 @@ void runFixedFallbackCycle() {
 void startClockSync() {
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   timeSyncRequested = true;
+  timeSynced = false;
   Serial.println("NTP Time sync requested...");
 }
 
@@ -376,7 +443,16 @@ bool connectMqtt() {
   String clientId = "esp32-traffic-light-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   Serial.print("Connecting MQTT...");
 
-  bool ok = mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD);
+  const char *offlinePayload = "{\"device_id\":\"" DEVICE_ID "\",\"tls_id\":\"" TLS_ID "\",\"status\":\"offline\"}";
+  bool ok = mqttClient.connect(
+    clientId.c_str(),
+    MQTT_USERNAME,
+    MQTT_PASSWORD,
+    MQTT_STATUS_TOPIC,
+    1,
+    true,
+    offlinePayload
+  );
 
   if (!ok) {
     Serial.print("failed, rc=");
@@ -385,6 +461,9 @@ bool connectMqtt() {
   }
 
   Serial.println("connected");
+  publishStatus("online");
+  publishTelemetry();
+  lastTelemetryMs = millis();
   mqttClient.subscribe(MQTT_TOPIC);
   return true;
 }
@@ -438,6 +517,7 @@ void loop() {
       lastTimeSyncCheckMs = millis();
       if (currentEpochMs() > 0) {
         Serial.println("NTP Time Synchronized successfully.");
+        timeSynced = true;
         timeSyncRequested = false; // Hoàn thành đồng bộ
       }
     }
@@ -453,6 +533,7 @@ void loop() {
     }
   } else {
     mqttClient.loop();
+    maintainTelemetry();
   }
 
   unsigned long now = millis();

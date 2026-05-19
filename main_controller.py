@@ -757,6 +757,44 @@ def build_mqtt_topic(area, intersection_id):
     return "traffic/%s/%s/state" % (area, intersection_id)
 
 
+def mark_selected_tls(tls_id, area, intersection_id):
+    """Danh dau nut den dang publish trong SUMO GUI."""
+    try:
+        x, y = traci.junction.getPosition(tls_id)
+        marker_id = "mqtt_marker_%s_%s_%s" % (area, intersection_id, tls_id)
+        square_id = marker_id + "_box"
+        size = 18
+
+        traci.poi.add(
+            marker_id,
+            x,
+            y,
+            (255, 0, 0, 255),
+            poiType="MQTT_SELECTED_TLS",
+            layer=100,
+            width=8,
+            height=8,
+        )
+        traci.polygon.add(
+            square_id,
+            [
+                (x - size, y - size),
+                (x + size, y - size),
+                (x + size, y + size),
+                (x - size, y + size),
+            ],
+            (255, 0, 0, 180),
+            fill=False,
+            polygonType="MQTT_SELECTED_TLS_BOX",
+            layer=99,
+            lineWidth=4,
+        )
+        print("[SUMO] Marked MQTT TLS %s at topic traffic/%s/%s/state" % (
+            tls_id, area, intersection_id))
+    except Exception as e:
+        print("[SUMO][WARN] Cannot mark TLS %s: %s" % (tls_id, e))
+
+
 def run(args):
     global traci
 
@@ -818,6 +856,7 @@ def run(args):
             mqtt_topic,
         )
         mqtt_publisher.connect()
+        mark_selected_tls(args.tls_id, args.area, args.intersection_id)
 
     last_dash = 0
     realtime_start_wall = None
