@@ -22,10 +22,10 @@ PEAK_HOURS = [
 END_TIME = 15000      # ~4.17 giờ (15000 giây)
 
 # Tần suất (càng lớn càng ít xe)
-p_motor_peak = 2      # xe máy (peak - cao điểm)
-p_motor_offpeak = 10   # xe máy (off-peak - không cao điểm)
+p_motor_peak = 3      # xe máy (peak - cao điểm)
+p_motor_offpeak = 8   # xe máy (off-peak - không cao điểm)
 p_car_peak = 6        # ô tô (peak)
-p_car_offpeak = 15     # ô tô (off-peak)
+p_car_offpeak =  16    # ô tô (off-peak)
 
 # Scale traffic volume by map width. These base periods are tuned for the
 # current map.net.xml width: 266.39 - 24.32 = 242.07m.
@@ -177,7 +177,7 @@ vtype_car = ET.Element("vType", {
     "vClass": "passenger",
 
     # Kích thước / động lực học
-    "accel": "1.0",
+    "accel": "0.5",
     "decel": "4.5",
     "emergencyDecel": "9.0",
 
@@ -214,12 +214,12 @@ vtype_motor = ET.Element("vType", {
     "vClass": "motorcycle",
 
     # Kích thước / động lực học
-    "accel": "2.0",
+    "accel": "1.0",
     "decel": "4.5",
     "emergencyDecel": "8.0",
 
     "length": "1.8",
-    "width": "0.65",
+    "width": "0.6",
     "minGap": "1.2",
 
     # Bám xe: tăng an toàn nhưng vẫn hợp xe máy

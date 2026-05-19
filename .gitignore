@@ -21,3 +21,9 @@ runs/
 
 # Environment files
 .env
+
+# ESP32 local secrets
+esp32_traffic_light/config.h
+
+# Runtime logs
+controller_*.log
