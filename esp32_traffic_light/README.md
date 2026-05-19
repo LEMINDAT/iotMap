@@ -52,7 +52,7 @@ traffic/A/+/status
 traffic/A/+/telemetry
 traffic/A/+/state
 ```
-
+![Dashboard](image.png)
 ## Matching Python Command
 
 ```powershell

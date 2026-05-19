@@ -135,7 +135,7 @@ void publishStatus(const char *status) {
 
   char buffer[192];
   size_t len = serializeJson(doc, buffer);
-  mqttClient.publish(MQTT_STATUS_TOPIC, buffer, len, true);
+  mqttClient.publish(MQTT_STATUS_TOPIC, reinterpret_cast<const uint8_t *>(buffer), len, true);
 }
 
 void publishTelemetry() {
@@ -160,7 +160,7 @@ void publishTelemetry() {
 
   char buffer[512];
   size_t len = serializeJson(doc, buffer);
-  mqttClient.publish(MQTT_TELEMETRY_TOPIC, buffer, len, false);
+  mqttClient.publish(MQTT_TELEMETRY_TOPIC, reinterpret_cast<const uint8_t *>(buffer), len, false);
 }
 
 void maintainTelemetry() {
@@ -320,8 +320,7 @@ void startClockSync() {
 }
 
 void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
-  // Khuyến nghị: Thay StaticJsonDocument bằng JsonDocument nếu dùng ArduinoJson V7
-  JsonDocument doc; 
+  StaticJsonDocument<1024> doc;
   DeserializationError error = deserializeJson(doc, payload, length);
   if (error) {
     Serial.print("JSON parse failed: ");
